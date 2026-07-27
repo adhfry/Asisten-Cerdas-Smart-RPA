@@ -17,11 +17,11 @@ from datetime import datetime
 import urllib.request
 import urllib.error
 
-AUTO_PRINT_DELAY_SPP_MIN = 5
-AUTO_PRINT_DELAY_SPP_MAX = 10
-AUTO_PRINT_DELAY_FKPP_MIN = 10
-AUTO_PRINT_DELAY_FKPP_MAX = 15
-AUTO_PRINT_POST_DELAY_SPP = 2
+AUTO_PRINT_DELAY_SPP_MIN = 12
+AUTO_PRINT_DELAY_SPP_MAX = 16
+AUTO_PRINT_DELAY_FKPP_MIN = 12
+AUTO_PRINT_DELAY_FKPP_MAX = 16
+AUTO_PRINT_POST_DELAY_SPP = 3
 AUTO_PRINT_POST_DELAY_FKPP = 3
 AUTO_PRINT_MIN_DELAY = 2
 ENABLE_KIOSK_PRINTING = True
@@ -640,7 +640,7 @@ def jalankan_pelayanan(driver, wb_data, sheet_data, path_file):
             driver.find_element(By.ID, "btnCariPendaftaran").click()
             time.sleep(0.5)
             tunggu_loading_pace(driver)
-            time.sleep(2)
+            time.sleep(4)
             
             # 6. Cek Data Tidak Ditemukan
             try:
