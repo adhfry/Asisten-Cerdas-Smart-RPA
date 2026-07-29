@@ -16,6 +16,7 @@ import json
 from datetime import datetime
 import urllib.request
 import urllib.error
+import subprocess
 
 AUTO_PRINT_DELAY_SPP_MIN = 12
 AUTO_PRINT_DELAY_SPP_MAX = 16
@@ -137,8 +138,34 @@ def ketik_seperti_manusia(elemen, teks):
 def tunggu_loading_pace(driver):
     try:
         WebDriverWait(driver, 30).until(EC.invisibility_of_element_located((By.CSS_SELECTOR, ".pace-active")))
-        time.sleep(0.5) 
+        time.sleep(0.5)
     except:
+        pass
+
+def tutup_modal_alert(driver):
+    try:
+        btn_modal_ok = WebDriverWait(driver, 5).until(EC.element_to_be_clickable((By.CSS_SELECTOR, "button.bootbox-accept")))
+        btn_modal_ok.click()
+        tunggu_loading_pace(driver)
+    except Exception:
+        pass
+
+    # Notifikasi jenis "toast" (data-notify, mis. banner REMINDER) — beda struktur
+    # dari modal bootbox, dan sering menutupi elemen lain sehingga menyebabkan
+    # 'element click intercepted'. Klik tombol dismiss-nya kalau ada, lalu hapus
+    # paksa lewat JS sebagai jaring pengaman kalau tombolnya tidak mempan.
+    try:
+        for btn in driver.find_elements(By.CSS_SELECTOR, "[data-notify='container'] [data-notify='dismiss']"):
+            try:
+                driver.execute_script("arguments[0].click();", btn)
+            except Exception:
+                pass
+        driver.execute_script("""
+            document.querySelectorAll('[data-notify="container"]').forEach(function (el) {
+                if (el.textContent.includes('REMINDER')) { el.remove(); }
+            });
+        """)
+    except Exception:
         pass
 
 def cek_sesi_berakhir(driver):
@@ -248,23 +275,129 @@ def jalankan_auto_print(driver, min_delay, max_delay, post_delay):
     except Exception:
         return False
 
-def tunggu_captcha_dan_login(driver, timeout=600):
+def pastikan_turnstile_terselesaikan(driver):
     try:
-        WebDriverWait(driver, 30).until(EC.visibility_of_element_located((By.ID, "CaptchaInputText")))
+        # Beberapa halaman pakai id "pcare-turnstile" (dashboard/login), yang lain
+        # pakai "pcare-turnstile-slot" (halaman search Pelayanan) - cocokkan keduanya.
+        # Hanya dipakai untuk cek KEBERADAAN widget, bukan disimpan & dipakai belakangan -
+        # elemen ini gampang berubah/di-render ulang oleh Cloudflare (stale element).
+        WebDriverWait(driver, 3).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, "div.cf-turnstile, [id^='pcare-turnstile']"))
+        )
     except Exception:
-        print("⚠️ CAPTCHA tidak ditemukan. Pastikan halaman login terbuka.")
+        return True  # Tidak ada widget Turnstile di halaman ini
+
+    def token_terisi():
+        try:
+            token_val = driver.execute_script(
+                "const el = document.querySelector('input[name=\"cf-turnstile-response\"]');"
+                "return el ? el.value : '';"
+            )
+        except Exception:
+            token_val = ""
+        return bool(token_val and token_val.strip())
+
+    # Beri kesempatan widget auto-pass sendiri (mode invisible/managed) - ini jalur
+    # paling andal karena browser ini asli/tidak terdeteksi otomasi. EzSolver (browser
+    # terpisah) TIDAK dipakai di sini lagi: tokennya kerap ditolak server dan pernah
+    # menyebabkan crash 'stale element reference' saat halaman re-render selagi solve.
+    for _ in range(30):
+        if token_terisi():
+            return True
+        time.sleep(0.5)
+
+    print("-> Widget Cloudflare Turnstile belum terverifikasi otomatis.")
+    input("Silakan selesaikan verifikasi Turnstile secara manual di browser (tunggu sampai centang hijau 'Success'), lalu tekan ENTER di sini...")
+    if not token_terisi():
+        print("⚠️ Turnstile masih belum terverifikasi, tetap melanjutkan (mungkin gagal di langkah berikutnya).")
+    return True
+
+EZSOLVER_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ezsolver")
+
+def coba_solve_turnstile_ezsolver(driver, timeout=45):
+    """Coba selesaikan Turnstile otomatis pakai EzSolver (browser nodriver terpisah).
+    Khusus dipakai di form input kunjungan - titik ini paling sering minta
+    verifikasi ulang. Return False kalau gagal (caller wajib fallback manual)."""
+    try:
+        sitekey = driver.execute_script(
+            "const el = document.querySelector('div.cf-turnstile, [id^=\"pcare-turnstile\"]');"
+            "if (el && el.getAttribute('data-sitekey')) return el.getAttribute('data-sitekey');"
+            "return window.TURNSTILE_SITEKEY || null;"
+        )
+        action = driver.execute_script(
+            "const el = document.querySelector('div.cf-turnstile, [id^=\"pcare-turnstile\"]');"
+            "if (el && el.getAttribute('data-action')) return el.getAttribute('data-action');"
+            "return window.TURNSTILE_ACTION || null;"
+        )
+        if not sitekey:
+            return False
+        siteurl = driver.current_url
+
+        sys.path.insert(0, EZSOLVER_DIR)
+        from solver import solve
+
+        print("-> Mencoba menyelesaikan Turnstile otomatis via EzSolver...")
+        token = solve(sitekey, siteurl, timeout=timeout, action=action)
+
+        driver.execute_script(
+            "const token = arguments[0];"
+            "let input = document.querySelector('input[name=\"cf-turnstile-response\"]');"
+            "if (input) { input.value = token; }"
+            "if (window.pcareTurnstileCallback) { try { window.pcareTurnstileCallback(token); } catch(e) {} }",
+            token
+        )
+        print("-> Turnstile terselesaikan otomatis via EzSolver.")
+        return True
+    except Exception as e:
+        print(f"⚠️ EzSolver gagal menyelesaikan Turnstile: {str(e)[:80]}")
         return False
 
+def pastikan_turnstile_form_kunjungan(driver, timeout_solver=45):
+    """Dipanggil khusus setelah form input kunjungan terbuka (titik yang sering
+    minta verifikasi Turnstile ulang). Coba EzSolver dulu, kalau gagal fallback
+    ke alur manual (tunggu auto-pass lalu minta konfirmasi ENTER)."""
+    try:
+        WebDriverWait(driver, 3).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, "div.cf-turnstile, [id^='pcare-turnstile']"))
+        )
+    except Exception:
+        return True  # Tidak ada widget Turnstile di form ini
+
+    def token_terisi():
+        try:
+            token_val = driver.execute_script(
+                "const el = document.querySelector('input[name=\"cf-turnstile-response\"]');"
+                "return el ? el.value : '';"
+            )
+        except Exception:
+            token_val = ""
+        return bool(token_val and token_val.strip())
+
+    if token_terisi():
+        return True
+
+    if coba_solve_turnstile_ezsolver(driver, timeout=timeout_solver) and token_terisi():
+        return True
+
+    return pastikan_turnstile_terselesaikan(driver)
+
+def tunggu_turnstile_dan_login(driver, timeout=600):
+    pastikan_turnstile_terselesaikan(driver)
+
     mulai = time.time()
+    sudah_pesan_manual = False
     while True:
         try:
-            captcha_val = driver.find_element(By.ID, "CaptchaInputText").get_attribute("value")
+            token_val = driver.execute_script(
+                "const el = document.querySelector('input[name=\"cf-turnstile-response\"]');"
+                "return el ? el.value : '';"
+            )
         except Exception:
-            captcha_val = ""
+            token_val = ""
 
-        if captcha_val and 5 <= len(captcha_val.strip()) <= 6:
+        if token_val and token_val.strip():
             for s in range(3, 0, -1):
-                print(f"-> CAPTCHA terdeteksi. Login otomatis dalam {s}...")
+                print(f"-> Turnstile terverifikasi. Login otomatis dalam {s}...")
                 time.sleep(1)
             try:
                 driver.find_element(By.ID, "btnLogin").click()
@@ -273,8 +406,12 @@ def tunggu_captcha_dan_login(driver, timeout=600):
                 print(f"⚠️ Gagal klik Sign In: {str(e)[:30]}")
                 return False
 
+        if not sudah_pesan_manual and time.time() - mulai > 8:
+            print("-> Menunggu verifikasi Cloudflare Turnstile... Jika macet, klik kotak centang di browser secara manual.")
+            sudah_pesan_manual = True
+
         if time.time() - mulai > timeout:
-            lanjut = input("CAPTCHA belum terdeteksi. ENTER = lanjut menunggu, n = batal: ").strip().lower()
+            lanjut = input("Turnstile belum terverifikasi. ENTER = lanjut menunggu, n = batal: ").strip().lower()
             if lanjut == 'n':
                 return False
             mulai = time.time()
@@ -308,6 +445,77 @@ def ambil_pesan_notif(driver):
     except Exception:
         return ""
 
+def klik_search_dengan_retry_captcha(driver, klik_search_fn, tunggu_detik=4):
+    """Klik tombol search. Kalau server menolak dengan pesan verifikasi/captcha gagal,
+    coba selesaikan Turnstile otomatis via EzSolver dulu lalu ulangi klik search -
+    kalau EzSolver juga gagal/tetap ditolak, baru minta user refresh & mengulang
+    pencarian secara manual di browser, lalu bot lanjut setelah user konfirmasi siap."""
+    klik_search_fn()
+    time.sleep(0.5)
+    tunggu_loading_pace(driver)
+    time.sleep(tunggu_detik)
+
+    pesan = ambil_pesan_notif(driver)
+    gagal_verifikasi = bool(pesan) and ("captcha" in pesan.lower() or "verifikasi" in pesan.lower())
+    if not gagal_verifikasi:
+        return True
+
+    print(f"⚠️ {pesan}")
+    print("-> Verifikasi Turnstile ditolak server, mencoba menyelesaikan otomatis via EzSolver...")
+    if coba_solve_turnstile_ezsolver(driver):
+        klik_search_fn()
+        time.sleep(0.5)
+        tunggu_loading_pace(driver)
+        time.sleep(tunggu_detik)
+
+        pesan_ulang = ambil_pesan_notif(driver)
+        gagal_lagi = bool(pesan_ulang) and ("captcha" in pesan_ulang.lower() or "verifikasi" in pesan_ulang.lower())
+        if not gagal_lagi:
+            print("-> Pencarian berhasil setelah Turnstile diselesaikan via EzSolver.")
+            return True
+        print(f"⚠️ {pesan_ulang}")
+        print("-> EzSolver tetap ditolak server untuk pencarian ini.")
+
+    print("   Silakan REFRESH halaman (F5) di browser, lalu ulangi pencarian secara manual sampai data pasien muncul.")
+    input("Setelah data pasien tampil di browser, tekan ENTER di sini untuk bot melanjutkan proses...")
+    return True
+
+def tunggu_klik_cari_pasien_oleh_user(driver, timeout=180):
+    """Klik Cari PERTAMA untuk tiap pasien baru dilakukan USER secara manual (klik asli
+    manusia lebih reliable untuk Turnstile daripada bot) - field tanggal/BPJS tetap diisi
+    otomatis oleh bot, tapi bot cuma menunggu (tanpa perlu ENTER) sampai nama pasien
+    tampil, alert 'Data tidak ditemukan' muncul, atau timeout habis.
+    Nama & notif yang SUDAH ada sebelum mulai menunggu (sisa dari pasien sebelumnya)
+    diabaikan - hanya perubahan yang muncul SETELAH ini yang dianggap hasil klik user,
+    supaya bot tidak salah kira status pasien lama sebagai hasil klik pasien baru.
+    Return: ("ditemukan", nama) / ("tidak_ditemukan", pesan) / ("timeout", None)"""
+    try:
+        nama_awal = driver.find_element(By.ID, "lblnmpst").text.strip()
+    except Exception:
+        nama_awal = ""
+    pesan_awal = ambil_pesan_notif(driver)
+
+    akhir = time.time() + timeout
+    pesan_terakhir_dicetak = ""
+    while time.time() < akhir:
+        try:
+            nama = driver.find_element(By.ID, "lblnmpst").text.strip()
+        except Exception:
+            nama = ""
+        if nama and nama != nama_awal:
+            return "ditemukan", nama
+
+        pesan = ambil_pesan_notif(driver)
+        if pesan and pesan != pesan_awal:
+            if "tidak ditemukan" in pesan.lower():
+                return "tidak_ditemukan", pesan
+            if pesan != pesan_terakhir_dicetak and ("captcha" in pesan.lower() or "verifikasi" in pesan.lower()):
+                print(f"⚠️ {pesan} (silakan klik Cari lagi di browser)")
+                pesan_terakhir_dicetak = pesan
+
+        time.sleep(1)
+    return "timeout", None
+
 def tunggu_hasil_login(driver, timeout=15):
     mulai = time.time()
     while True:
@@ -319,6 +527,7 @@ def tunggu_hasil_login(driver, timeout=15):
         if msg:
             msg_lower = msg.lower()
             if "gagal" in msg_lower or "captcha" in msg_lower or "password" in msg_lower or "username" in msg_lower:
+                print(f"⚠️ Pesan dari sistem PCare: {msg}")
                 return "failed"
         if time.time() - mulai > timeout:
             return "timeout"
@@ -331,6 +540,7 @@ def cek_modal_login_gagal(driver):
         if msg:
             msg_lower = msg.lower()
             if "captcha" in msg_lower or "salah" in msg_lower or "gagal" in msg_lower:
+                print(f"⚠️ Pesan dari sistem PCare: {msg}")
                 try:
                     driver.find_element(By.CSS_SELECTOR, "button.bootbox-accept").click()
                 except Exception:
@@ -471,12 +681,39 @@ def buka_riwayat_setelah_simpan(driver, tgl_rujukan, max_retry=3, require_labkes
             time.sleep(0.2)
             btn_cari.click()
             tunggu_loading_pace(driver)
+            time.sleep(1.5)
         except Exception as e:
             print(f"⚠️ Gagal klik Cari Pendaftaran (percobaan {percobaan}/{max_retry}): {str(e)[:30]}")
             if percobaan < max_retry:
                 time.sleep(1)
                 continue
             return False
+
+        # Klik Cari di sini juga bisa kecegat Turnstile ("Verifikasi keamanan gagal...")
+        # sama seperti pencarian pasien awal - kalau ini terjadi, tabel riwayat tidak akan
+        # pernah muncul walau di-retry berkali-kali. Coba EzSolver dulu, baru minta
+        # refresh manual kalau EzSolver juga gagal.
+        pesan = ambil_pesan_notif(driver)
+        if pesan and ("captcha" in pesan.lower() or "verifikasi" in pesan.lower()):
+            print(f"⚠️ {pesan}")
+            print("-> Verifikasi Turnstile ditolak server saat membuka riwayat pasca-simpan, mencoba EzSolver...")
+            berhasil_ezsolver = False
+            if coba_solve_turnstile_ezsolver(driver):
+                btn_cari.click()
+                tunggu_loading_pace(driver)
+                time.sleep(1.5)
+                pesan_ulang = ambil_pesan_notif(driver)
+                if not (pesan_ulang and ("captcha" in pesan_ulang.lower() or "verifikasi" in pesan_ulang.lower())):
+                    print("-> Berhasil setelah Turnstile diselesaikan via EzSolver.")
+                    berhasil_ezsolver = True
+                else:
+                    print(f"⚠️ {pesan_ulang}")
+                    print("-> EzSolver tetap ditolak server.")
+
+            if not berhasil_ezsolver:
+                print("   Silakan REFRESH halaman (F5) di browser, lalu ulangi pencarian secara manual sampai data pasien tampil.")
+                input("Setelah data pasien tampil di browser, tekan ENTER di sini untuk bot melanjutkan proses...")
+                tunggu_loading_pace(driver)
 
         try:
             link_riwayat = WebDriverWait(driver, 10).until(EC.element_to_be_clickable((By.CSS_SELECTOR, "#linkRiwayat a")))
@@ -548,6 +785,31 @@ def buka_riwayat_setelah_simpan(driver, tgl_rujukan, max_retry=3, require_labkes
         return True
     return False
 
+def cek_faskes_pelayanan_labkesda(driver, timeout=5):
+    akhir = time.time() + timeout
+    while time.time() < akhir:
+        try:
+            teks = driver.find_element(By.ID, "faskesPelayan_lbl").text
+        except Exception:
+            teks = ""
+        if "LABKES" in teks.upper():
+            return True
+        time.sleep(0.3)
+    return False
+
+def ambil_data_klinis_dari_excel(sheet_data, row):
+    kolom = {
+        'suhu': 20, 'tinggi': 21, 'berat': 22, 'lingkar': 23, 'imt': 24,
+        'sistole': 25, 'diastole': 26, 'resprate': 27, 'heartrate': 28,
+    }
+    data = {}
+    for key, col in kolom.items():
+        val = sheet_data.cell(row=row, column=col).value
+        if val is None or str(val).strip() == "":
+            return None
+        data[key] = str(val).strip()
+    return data
+
 def pilih_baris_riwayat_berdasarkan_tanggal(driver, tgl_rujukan):
     baris_riwayat = driver.find_elements(
         By.XPATH,
@@ -564,41 +826,72 @@ def pilih_baris_riwayat_berdasarkan_tanggal(driver, tgl_rujukan):
     faskes_pertama = kolom_pertama[1].text.strip() if len(kolom_pertama) > 1 else ""
     return baris_riwayat[0], faskes_pertama
 
-def jalankan_pelayanan(driver, wb_data, sheet_data, path_file):
+def jalankan_pelayanan(driver, wb_data, sheet_data, path_file, nama_pasien_resume=None):
     print("\n" + "="*50)
     print(" MEMULAI MODE: PELAYANAN PASIEN")
     print("="*50)
-    
+
     tunggu_loading_pace(driver)
+
+    # Kalau tab ini sudah berada di halaman Pelayanan Pasien dengan data pasien
+    # yang sudah tampil (mis. hasil pencarian manual gara-gara Turnstile), jangan
+    # navigasi ulang lewat menu - itu akan mereset form yang sudah terisi.
+    sudah_di_halaman_pelayanan = False
     try:
-        driver.find_element(By.XPATH, "//a[contains(text(), 'Entri Data')]").click()
-        time.sleep(0.5)
-        driver.find_element(By.XPATH, "//a[contains(text(), 'Pelayanan Pasien')]").click()
-        tunggu_loading_pace(driver)
-        print("-> Berhasil masuk ke halaman Pelayanan Pasien.")
-    except Exception as e:
-        print(f"-> Gagal navigasi ke menu Pelayanan Pasien: {e}")
-        return
+        sudah_di_halaman_pelayanan = "entrikunjungandokkel" in driver.current_url.lower()
+    except Exception:
+        pass
+
+    if sudah_di_halaman_pelayanan and nama_pasien_resume:
+        print(f"-> Melanjutkan dari tab yang sudah terbuka di halaman Pelayanan Pasien (pasien: {nama_pasien_resume}), navigasi menu dilewati.")
+    else:
+        try:
+            driver.find_element(By.XPATH, "//a[contains(text(), 'Entri Data')]").click()
+            time.sleep(0.5)
+            driver.find_element(By.XPATH, "//a[contains(text(), 'Pelayanan Pasien')]").click()
+            tunggu_loading_pace(driver)
+            print("-> Berhasil masuk ke halaman Pelayanan Pasien.")
+        except Exception as e:
+            print(f"-> Gagal navigasi ke menu Pelayanan Pasien: {e}")
+            return
+
+    tutup_modal_alert(driver)
+
+    # Pastikan Turnstile benar-benar terverifikasi dulu di sini, sebelum memproses
+    # baris apa pun - bukan disisipkan di tengah pengisian data per pasien.
+    pastikan_turnstile_terselesaikan(driver)
 
     maks_baris = sheet_data.max_row
     yes_to_all = False
     skip_name_check = False
     tenaga_medis_tersimpan = None
     auto_print = False
-    
+    baris_kosong_berturut = 0
+
     for row in range(4, maks_baris + 1):
         if cek_sesi_berakhir(driver):
             driver.get("https://pcarejkn.bpjs-kesehatan.go.id/eclaim/EntriKunjunganDokkel")
             tunggu_loading_pace(driver)
+            tutup_modal_alert(driver)
 
         nama_excel = sheet_data.cell(row=row, column=2).value
         penyakit = str(sheet_data.cell(row=row, column=3).value).strip()
         penyakit_upper = str(penyakit).upper()
-        no_bpjs = sheet_data.cell(row=row, column=4).value    
-        tgl_rujukan = sheet_data.cell(row=row, column=17).value 
-        status_pendaftaran = sheet_data.cell(row=row, column=18).value 
-        status_finish = sheet_data.cell(row=row, column=29).value 
-        
+        no_bpjs = sheet_data.cell(row=row, column=4).value
+        tgl_rujukan = sheet_data.cell(row=row, column=17).value
+        status_pendaftaran = sheet_data.cell(row=row, column=18).value
+        status_finish = sheet_data.cell(row=row, column=29).value
+
+        nama_kosong = not nama_excel or str(nama_excel).strip() == ""
+        bpjs_kosong = not no_bpjs or str(no_bpjs).strip() == "" or str(no_bpjs).lower() == "kosong"
+        if nama_kosong and bpjs_kosong:
+            baris_kosong_berturut += 1
+            if baris_kosong_berturut >= 5:
+                print(f"-> Mendeteksi {baris_kosong_berturut} baris kosong berturut-turut, dianggap akhir data (berhenti di baris {row}).")
+                break
+            continue
+        baris_kosong_berturut = 0
+
         if not no_bpjs or str(no_bpjs).lower() == "kosong":
             continue
             
@@ -614,57 +907,125 @@ def jalankan_pelayanan(driver, wb_data, sheet_data, path_file):
             continue
 
         print(f"\n[{row}/{maks_baris}] Memproses Pelayanan: {nama_excel} | BPJS: {no_bpjs}")
-        
+
+        # Baris pertama yang namanya cocok dengan pasien yang sudah tampil di tab
+        # (nama_pasien_resume) tidak perlu dicari ulang - data sudah ada di layar.
+        # Hanya dipakai sekali, baris-baris berikutnya tetap search seperti biasa.
+        resume_baris_ini = False
+        if nama_pasien_resume:
+            nama_excel_str = str(nama_excel).strip().lower()
+            nama_resume_str = nama_pasien_resume.strip().lower()
+            if nama_excel_str and (nama_excel_str in nama_resume_str or nama_resume_str in nama_excel_str):
+                resume_baris_ini = True
+            nama_pasien_resume = None
+
         try:
-            # 2. Input Tanggal 
-            input_tgl = WebDriverWait(driver, 10).until(EC.element_to_be_clickable((By.ID, "txttanggal")))
-            input_tgl.click()
-            input_tgl.send_keys(Keys.CONTROL + "a")
-            input_tgl.send_keys(Keys.BACKSPACE)
-            input_tgl.send_keys(str(tgl_rujukan))
-            input_tgl.send_keys(Keys.ESCAPE)
-            time.sleep(0.5)
+            if resume_baris_ini:
+                print("-> Data pasien ini sudah tampil di tab, melanjutkan tanpa mencari ulang.")
+            else:
+                # 2. Input Tanggal
+                input_tgl = WebDriverWait(driver, 10).until(EC.element_to_be_clickable((By.ID, "txttanggal")))
+                input_tgl.click()
+                input_tgl.send_keys(Keys.CONTROL + "a")
+                input_tgl.send_keys(Keys.BACKSPACE)
+                input_tgl.send_keys(str(tgl_rujukan))
+                input_tgl.send_keys(Keys.ESCAPE)
+                time.sleep(0.5)
 
-            # 3. Pilih Sumber Data
-            driver.find_element(By.ID, "rbkartu").click()
-            time.sleep(0.5)
+                # 3. Pilih Sumber Data
+                driver.find_element(By.ID, "rbkartu").click()
+                time.sleep(0.5)
 
-            # 4. Input BPJS
-            input_bpjs = driver.find_element(By.ID, "nomor")
-            input_bpjs.click()
-            input_bpjs.send_keys(Keys.CONTROL + "a")
-            input_bpjs.send_keys(Keys.BACKSPACE)
-            input_bpjs.send_keys(str(no_bpjs))
-            
-            # 5. Cari
-            driver.find_element(By.ID, "btnCariPendaftaran").click()
-            time.sleep(0.5)
-            tunggu_loading_pace(driver)
-            time.sleep(4)
-            
-            # 6. Cek Data Tidak Ditemukan
-            try:
-                alert_gagal = WebDriverWait(driver, 3).until(
-                    EC.visibility_of_element_located((By.XPATH, "//span[@data-notify='message' and contains(text(), 'Data tidak ditemukan')]"))
-                )
-                
-                print("⚠️ PERINGATAN: Data tidak ditemukan pada sistem PCare!")
-                sheet_data.cell(row=row, column=19).value = "Gagal: Data tidak ada"
-                sheet_data.cell(row=row, column=19).font = Font(color="FF0000") 
-                wb_data.save(path_file)
-                
-                konf = input("Ketik 'n' untuk stop bot, atau ENTER/'y' lanjut pasien berikutnya: ").strip().lower()
-                if konf == 'n': break
+                # 4. Input BPJS
+                input_bpjs = driver.find_element(By.ID, "nomor")
+                input_bpjs.click()
+                input_bpjs.send_keys(Keys.CONTROL + "a")
+                input_bpjs.send_keys(Keys.BACKSPACE)
+                input_bpjs.send_keys(str(no_bpjs))
+
+                # 5. Cari - klik PERTAMA untuk pasien baru ini dilakukan USER secara manual
+                # di browser (klik asli manusia lebih reliable untuk Turnstile daripada
+                # bot). Bot cuma menunggu otomatis sampai nama pasien tampil, tanpa ENTER.
+                print("-> Silakan klik tombol Cari (ikon kaca pembesar) di browser untuk pasien ini...")
+                lanjut_tunggu_cari = True
+                skip_baris_ini = False
+                stop_bot = False
+                percobaan_tidak_ditemukan = 0
+                while lanjut_tunggu_cari:
+                    lanjut_tunggu_cari = False
+                    status_cari, info_cari = tunggu_klik_cari_pasien_oleh_user(driver)
+
+                    if status_cari == "tidak_ditemukan":
+                        percobaan_tidak_ditemukan += 1
+                        print(f"⚠️ PERINGATAN: {info_cari} (percobaan {percobaan_tidak_ditemukan}/3)")
+                        if percobaan_tidak_ditemukan < 3:
+                            # Sering kali penyebabnya user lupa ganti tanggal/field lain,
+                            # bukan datanya benar-benar tidak ada - kasih kesempatan coba lagi
+                            # dulu sebelum benar-benar menganggap ini gagal.
+                            print("   Cek lagi tanggal/No.Kartu di form, lalu klik Cari lagi di browser...")
+                            lanjut_tunggu_cari = True
+                        else:
+                            sheet_data.cell(row=row, column=19).value = "Gagal: Data tidak ada"
+                            sheet_data.cell(row=row, column=19).font = Font(color="FF0000")
+                            wb_data.save(path_file)
+                            print("\n1. Ulangi pasien ini (coba cari lagi)")
+                            print("2. Lanjut pasien berikutnya")
+                            print("3. Stop bot")
+                            pilihan_gagal = input("Pilih (1/2/3): ").strip()
+                            if pilihan_gagal == '1':
+                                percobaan_tidak_ditemukan = 0
+                                lanjut_tunggu_cari = True
+                            elif pilihan_gagal == '3':
+                                stop_bot = True
+                                skip_baris_ini = True
+                            else:
+                                skip_baris_ini = True
+                    elif status_cari == "timeout":
+                        konf_timeout = input(
+                            "⚠️ Belum ada nama pasien muncul setelah beberapa saat. "
+                            "Ketik 'n' stop bot, 's' skip pasien ini, atau ENTER untuk terus menunggu: "
+                        ).strip().lower()
+                        if konf_timeout == 'n':
+                            stop_bot = True
+                            skip_baris_ini = True
+                        elif konf_timeout == 's':
+                            skip_baris_ini = True
+                        else:
+                            lanjut_tunggu_cari = True
+
+                if skip_baris_ini:
+                    if stop_bot: break
+                    continue
+
+            # 7. Cek Nama (retry: klik Cari lagi dulu, baru minta refresh manual kalau tetap kosong -
+            # jangan langsung skip baris, soalnya pencarian bisa "berhasil" tanpa alert apapun
+            # tapi nama tidak pernah ter-render).
+            nama_sistem = ""
+            for percobaan_nama in range(1, 3):
+                try:
+                    nama_sistem = WebDriverWait(driver, 5).until(EC.visibility_of_element_located((By.ID, "lblnmpst"))).text
+                except Exception:
+                    nama_sistem = ""
+
+                if nama_sistem.strip():
+                    break
+
+                if percobaan_nama == 1:
+                    print("⚠️ Nama pasien belum tampil, mencoba klik Cari lagi...")
+                    klik_search_dengan_retry_captcha(
+                        driver, lambda: driver.find_element(By.ID, "btnCariPendaftaran").click()
+                    )
+                else:
+                    print("⚠️ PERINGATAN: Nama pasien tetap gagal dimuat setelah dicoba ulang.")
+                    print(f"   Silakan REFRESH halaman (F5) di browser lalu cari pasien ini secara manual (No.Kartu: {no_bpjs}).")
+                    input("Setelah nama pasien tampil di browser, tekan ENTER di sini untuk bot melanjutkan proses...")
+
+            if not nama_sistem.strip():
+                print("⚠️ PERINGATAN: Nama pasien tetap tidak ditemukan.")
+                konf_nama_kosong = input("Ketik 'n' untuk stop bot, atau ENTER/'y' lanjut pasien berikutnya: ").strip().lower()
+                if konf_nama_kosong == 'n': break
                 continue
-            except: pass
 
-            # 7. Cek Nama
-            try:
-                nama_sistem = WebDriverWait(driver, 5).until(EC.visibility_of_element_located((By.ID, "lblnmpst"))).text
-            except:
-                print("⚠️ PERINGATAN: Nama pasien gagal dimuat. Melewati baris ini...")
-                continue
-                
             is_nama_cocok = str(nama_excel).strip().lower() in str(nama_sistem).strip().lower() or str(nama_sistem).strip().lower() in str(nama_excel).strip().lower()
             if not is_nama_cocok:
                 print(f"⚠️ NAMA BERBEDA! Excel: {nama_excel} | Sistem: {nama_sistem}")
@@ -679,23 +1040,31 @@ def jalankan_pelayanan(driver, wb_data, sheet_data, path_file):
                         wb_data.save(path_file)
                         continue
 
+            # Kalau 9 kolom data klinis (suhu s/d heart rate) sudah tercatat di Excel
+            # dari proses sebelumnya, tidak perlu ekstrak ulang dari riwayat non-LABKESDA -
+            # tapi tabel riwayat tetap dicek dulu, siapa tahu kunjungan LABKESDA-nya
+            # sendiri sudah berhasil dibuat sebelumnya (proses lama sempat terhenti
+            # setelah simpan, sebelum sempat mengisi hasil lab) - kalau sudah ada,
+            # jangan buat kunjungan baru lagi (duplikat), langsung lanjut ke input hasil lab.
+            data_klinis_excel = ambil_data_klinis_dari_excel(sheet_data, row)
+
             # 8. Tampilkan Riwayat Pelayanan
             try:
                 btn_riwayat = driver.find_element(By.XPATH, "//a[contains(@onclick, 'toggleRiwayatPelayanan')]")
                 driver.execute_script("arguments[0].scrollIntoView({behavior: 'smooth', block: 'center'});", btn_riwayat)
                 time.sleep(0.5)
             except: pass
-            
+
             driver.execute_script("Riwayat.instance.toggleRiwayatPelayanan();")
-            time.sleep(1.0) 
+            time.sleep(1.0)
             tunggu_loading_pace(driver)
             try:
                 WebDriverWait(driver, 15).until(EC.invisibility_of_element_located((By.ID, "riwayatPelayanan_processing")))
             except: pass
-                
+
             WebDriverWait(driver, 10).until(EC.visibility_of_element_located((By.ID, "riwayatPelayanan")))
             time.sleep(1.5)
-            
+
             # 9. Cari Tanggal Rujukan
             baris_terpilih, faskes_terpilih = pilih_baris_riwayat_berdasarkan_tanggal(driver, tgl_rujukan)
             if not baris_terpilih:
@@ -703,55 +1072,65 @@ def jalankan_pelayanan(driver, wb_data, sheet_data, path_file):
                 konf = input("Ketik 'n' untuk stop bot, atau ENTER/'y' lanjut pasien berikutnya: ").strip().lower()
                 if konf == 'n': break
                 continue
-            
+
             labkesda_ditemukan = "LABKES" in faskes_terpilih.upper()
             gunakan_riwayat_lab = labkesda_ditemukan
             if labkesda_ditemukan:
                 print(f"-> Riwayat LABKESDA ditemukan: {faskes_terpilih}")
+            elif data_klinis_excel:
+                print(f"-> Riwayat LABKESDA belum ditemukan (memakai baris: {faskes_terpilih or '-'}), data klinis sudah ada di Excel - langsung buat kunjungan baru untuk LABKESDA (riwayat lama tidak dibuka).")
             else:
                 print(f"-> Riwayat LABKESDA tidak ditemukan, memakai baris: {faskes_terpilih or '-'}")
-                
-            btn_pilih_riwayat = baris_terpilih.find_element(By.XPATH, ".//button[contains(@class, 'btnView')]")
-            driver.execute_script("arguments[0].scrollIntoView({behavior: 'smooth', block: 'center'});", btn_pilih_riwayat)
-            time.sleep(0.5)
-            btn_pilih_riwayat.click()
-            tunggu_loading_pace(driver)
-            time.sleep(1.5)
-            if not tunggu_tab_nonkapi(driver):
-                print("⚠️ Tab Non Kapitasi belum muncul, melanjutkan dengan hati-hati.")
-            
-            if not gunakan_riwayat_lab:
-                # 10. Ekstrak Data Lama
-                print("-> Mengekstrak data riwayat klinis...")
-                suhu_input = driver.find_element(By.ID, "suhu_txt")
-                driver.execute_script("arguments[0].scrollIntoView({behavior: 'smooth', block: 'center'});", suhu_input)
-                time.sleep(0.5)
 
-                data_klinis = {
-                    'suhu': driver.find_element(By.ID, "suhu_txt").get_attribute('value'),
-                    'tinggi': driver.find_element(By.ID, "tinggiBadan").get_attribute('value'),
-                    'berat': driver.find_element(By.ID, "beratBadan").get_attribute('value'),
-                    'lingkar': driver.find_element(By.ID, "lingkarPerut").get_attribute('value'),
-                    'imt': driver.find_element(By.ID, "imt").get_attribute('value'),
-                    'sistole': driver.find_element(By.ID, "sistole").get_attribute('value'),
-                    'diastole': driver.find_element(By.ID, "diastole").get_attribute('value'),
-                    'resprate': driver.find_element(By.ID, "respRate").get_attribute('value'),
-                    'heartrate': driver.find_element(By.ID, "heartRate").get_attribute('value')
-                }
-                
-                sheet_data.cell(row=row, column=20).value = data_klinis['suhu']
-                sheet_data.cell(row=row, column=21).value = data_klinis['tinggi']
-                sheet_data.cell(row=row, column=22).value = data_klinis['berat']
-                sheet_data.cell(row=row, column=23).value = data_klinis['lingkar']
-                sheet_data.cell(row=row, column=24).value = data_klinis['imt']
-                sheet_data.cell(row=row, column=25).value = data_klinis['sistole']
-                sheet_data.cell(row=row, column=26).value = data_klinis['diastole']
-                sheet_data.cell(row=row, column=27).value = data_klinis['resprate']
-                sheet_data.cell(row=row, column=28).value = data_klinis['heartrate']
-                wb_data.save(path_file)
-                
+            # Baris riwayat hanya perlu dibuka kalau: (a) LABKESDA sudah ada (untuk lanjut
+            # ke input hasil lab di kunjungan itu), atau (b) belum ada data klinis sama
+            # sekali sehingga perlu diekstrak dari riwayat non-LABKESDA yang ditemukan.
+            if labkesda_ditemukan or not data_klinis_excel:
+                btn_pilih_riwayat = baris_terpilih.find_element(By.XPATH, ".//button[contains(@class, 'btnView')]")
+                driver.execute_script("arguments[0].scrollIntoView({behavior: 'smooth', block: 'center'});", btn_pilih_riwayat)
+                time.sleep(0.5)
+                btn_pilih_riwayat.click()
+                tunggu_loading_pace(driver)
+                time.sleep(1.5)
+                if not tunggu_tab_nonkapi(driver):
+                    print("⚠️ Tab Non Kapitasi belum muncul, melanjutkan dengan hati-hati.")
+
+                if not gunakan_riwayat_lab:
+                    # 10. Ekstrak Data Lama
+                    print("-> Mengekstrak data riwayat klinis...")
+                    suhu_input = driver.find_element(By.ID, "suhu_txt")
+                    driver.execute_script("arguments[0].scrollIntoView({behavior: 'smooth', block: 'center'});", suhu_input)
+                    time.sleep(0.5)
+
+                    data_klinis = {
+                        'suhu': driver.find_element(By.ID, "suhu_txt").get_attribute('value'),
+                        'tinggi': driver.find_element(By.ID, "tinggiBadan").get_attribute('value'),
+                        'berat': driver.find_element(By.ID, "beratBadan").get_attribute('value'),
+                        'lingkar': driver.find_element(By.ID, "lingkarPerut").get_attribute('value'),
+                        'imt': driver.find_element(By.ID, "imt").get_attribute('value'),
+                        'sistole': driver.find_element(By.ID, "sistole").get_attribute('value'),
+                        'diastole': driver.find_element(By.ID, "diastole").get_attribute('value'),
+                        'resprate': driver.find_element(By.ID, "respRate").get_attribute('value'),
+                        'heartrate': driver.find_element(By.ID, "heartRate").get_attribute('value')
+                    }
+
+                    sheet_data.cell(row=row, column=20).value = data_klinis['suhu']
+                    sheet_data.cell(row=row, column=21).value = data_klinis['tinggi']
+                    sheet_data.cell(row=row, column=22).value = data_klinis['berat']
+                    sheet_data.cell(row=row, column=23).value = data_klinis['lingkar']
+                    sheet_data.cell(row=row, column=24).value = data_klinis['imt']
+                    sheet_data.cell(row=row, column=25).value = data_klinis['sistole']
+                    sheet_data.cell(row=row, column=26).value = data_klinis['diastole']
+                    sheet_data.cell(row=row, column=27).value = data_klinis['resprate']
+                    sheet_data.cell(row=row, column=28).value = data_klinis['heartrate']
+                    wb_data.save(path_file)
+
+            if not gunakan_riwayat_lab and data_klinis_excel:
+                data_klinis = data_klinis_excel
+
+            if not gunakan_riwayat_lab:
                 print("\n" + "-"*40)
-                print(" HASIL EKSTRAKSI KLINIS TERSIMPAN ")
+                print(" DATA KLINIS UNTUK KUNJUNGAN BARU ")
                 print("-" * 40)
                 print(f" Suhu        : {data_klinis['suhu']} ℃")
                 print(f" Tinggi/Berat: {data_klinis['tinggi']} cm / {data_klinis['berat']} kg")
@@ -759,22 +1138,49 @@ def jalankan_pelayanan(driver, wb_data, sheet_data, path_file):
                 print(f" Tensi       : {data_klinis['sistole']}/{data_klinis['diastole']} mmHg")
                 print(f" Resp / HR   : {data_klinis['resprate']} / {data_klinis['heartrate']} bpm")
                 print("-" * 40)
-                
+
                 if not yes_to_all:
                     tanya_isi = input("Lanjut menginput hasil pemeriksaan ini? (Y = Lanjut / N = Stop / A = Lanjut Semua): ").strip().lower()
                     if tanya_isi == 'n': break
                     elif tanya_isi == 'a': yes_to_all = True
 
-            if not gunakan_riwayat_lab:
                 # 11. Mulai Input Pemeriksaan Baru (retry jika riwayat LABKESDA belum muncul)
                 simpan_berhasil = False
                 for percobaan_simpan in range(1, 4):
+                    # Klik Cari WAJIB diulang di sini untuk mengosongkan field kunjungan -
+                    # kalau sebelumnya sempat membuka baris riwayat non-LABKESDA (mis. GAPURA)
+                    # untuk cek/ekstrak data, form ini bisa masih merujuk ke kunjungan lama
+                    # itu (field/dropdown gagal diisi karena state form tidak sesuai).
                     print("-> Membuka form input kunjungan...")
-                    driver.find_element(By.ID, "btnCariPendaftaran").click() 
+                    # Klik Cari di sini juga bisa kena "Verifikasi keamanan gagal..." -
+                    # kalau dibiarkan, panel yang tampil masih panel LAMA (belum ter-reset)
+                    # sehingga cek faskesPelayan_lbl di bawah salah kira form sudah benar.
+                    klik_search_dengan_retry_captcha(
+                        driver, lambda: driver.find_element(By.ID, "btnCariPendaftaran").click()
+                    )
                     WebDriverWait(driver, 10).until(EC.visibility_of_element_located((By.ID, "panelEntriKunjungan")))
                     tunggu_loading_pace(driver)
                     time.sleep(1)
-                    
+
+                    # Titik ini kerap minta verifikasi Turnstile ulang - pastikan
+                    # benar-benar terverifikasi sebelum menyentuh field apa pun,
+                    # supaya dropdown/field di bawah tidak gagal karena overlay captcha.
+                    pastikan_turnstile_form_kunjungan(driver)
+
+                    # Pastikan form yang terbuka benar-benar untuk kunjungan LABKESDA yang
+                    # baru/kosong (cek label Faskes Pelayanan) - kalau masih menunjukkan
+                    # faskes lain (mis. GAPURA), jangan isi field apa pun, klik Cari lagi
+                    # di percobaan berikutnya sampai form-nya benar.
+                    if not cek_faskes_pelayanan_labkesda(driver):
+                        faskes_saat_ini = ""
+                        try:
+                            faskes_saat_ini = driver.find_element(By.ID, "faskesPelayan_lbl").text
+                        except Exception:
+                            pass
+                        print(f"⚠️ Faskes Pelayanan masih '{faskes_saat_ini or '-'}' (bukan LABKESDA), klik Cari lagi untuk reset form ({percobaan_simpan}/3)...")
+                        time.sleep(1)
+                        continue
+
                     # A. Keluhan & Anamnesa
                     txt_keluhan = ""
                     if "DM" in penyakit_upper and "HT" in penyakit_upper: txt_keluhan = "diabetes mellitus dan hipertensi"
@@ -1213,31 +1619,50 @@ def jalankan_pelayanan(driver, wb_data, sheet_data, path_file):
             # M. Cetak SPP
             btn_spp = WebDriverWait(driver, 10).until(EC.element_to_be_clickable((By.ID, "spp_btn")))
             btn_spp.click()
-            print("-> Tab SPP dibuka...")
+            print("-> Tab SPP dibuka, menunggu jendela cetak muncul...")
             window_utama = driver.current_window_handle
-            WebDriverWait(driver, 10).until(EC.number_of_windows_to_be(2))
-            for win in driver.window_handles:
-                if win != window_utama:
-                    driver.switch_to.window(win)
-                    if not auto_print:
-                        tanya_auto = input("Otomatis print semua? (1 = Ya, ENTER = Manual): ").strip()
-                        if tanya_auto == '1':
-                            auto_print = True
-                    if auto_print:
-                        jalankan_auto_print(
-                            driver,
-                            AUTO_PRINT_DELAY_SPP_MIN,
-                            AUTO_PRINT_DELAY_SPP_MAX,
-                            AUTO_PRINT_POST_DELAY_SPP
-                        )
-                    else:
-                        konfirmasi_spp = input("Selesai print SPP? (ENTER/y = tutup, n = stop): ").strip().lower()
-                        if konfirmasi_spp == 'n':
-                            stop_semua = True
-                            driver.switch_to.window(window_utama)
-                            break
-                    driver.close()
-            driver.switch_to.window(window_utama)
+            try:
+                # Tab SPP (generate PDF/print preview) kadang butuh lebih dari 10 detik
+                # untuk benar-benar terbuka sebagai window baru, atau malah keburu
+                # tertutup sendiri (auto-print lalu auto-close) sebelum sempat terdeteksi.
+                WebDriverWait(driver, 30).until(EC.number_of_windows_to_be(2))
+                for win in driver.window_handles:
+                    if win != window_utama:
+                        driver.switch_to.window(win)
+                        if not auto_print:
+                            tanya_auto = input("Otomatis print semua? (1 = Ya, ENTER = Manual): ").strip()
+                            if tanya_auto == '1':
+                                auto_print = True
+                        if auto_print:
+                            jalankan_auto_print(
+                                driver,
+                                AUTO_PRINT_DELAY_SPP_MIN,
+                                AUTO_PRINT_DELAY_SPP_MAX,
+                                AUTO_PRINT_POST_DELAY_SPP
+                            )
+                        else:
+                            konfirmasi_spp = input("Selesai print SPP? (ENTER/y = tutup, n = stop): ").strip().lower()
+                            if konfirmasi_spp == 'n':
+                                stop_semua = True
+                                driver.switch_to.window(window_utama)
+                                break
+                        driver.close()
+                driver.switch_to.window(window_utama)
+            except Exception as e:
+                # Jangan langsung dianggap error fatal (refresh/stop) - tab cetak sering
+                # gagal terdeteksi otomatis padahal cetaknya sendiri baik-baik saja.
+                # Biarkan user print sendiri lalu konfirmasi lanjut.
+                print(f"⚠️ Tab cetak SPP tidak terdeteksi otomatis: {str(e)[:60] or 'window tidak terbuka/tertutup sendiri'}.")
+                print("   Silakan cetak SPP secara manual di browser kalau belum tercetak, lalu tutup tab cetaknya.")
+                input("Setelah selesai, tekan ENTER di sini untuk bot melanjutkan (FKPP / pasien berikutnya)...")
+                try:
+                    for win in driver.window_handles:
+                        if win != window_utama:
+                            driver.switch_to.window(win)
+                            driver.close()
+                    driver.switch_to.window(window_utama)
+                except Exception:
+                    pass
 
             if stop_semua:
                 break
@@ -1252,31 +1677,47 @@ def jalankan_pelayanan(driver, wb_data, sheet_data, path_file):
                 driver.execute_script("arguments[0].scrollIntoView({behavior: 'smooth', block: 'center'});", btn_fkpp)
                 time.sleep(0.5)
                 btn_fkpp.click()
-                print("-> Tab FKPP dibuka...")
-                
-                WebDriverWait(driver, 10).until(EC.number_of_windows_to_be(2))
-                for win in driver.window_handles:
-                    if win != window_utama:
-                        driver.switch_to.window(win)
-                        if not auto_print:
-                            tanya_auto = input("Otomatis print semua? (1 = Ya, ENTER = Manual): ").strip()
-                            if tanya_auto == '1':
-                                auto_print = True
-                        if auto_print:
-                            jalankan_auto_print(
-                                driver,
-                                AUTO_PRINT_DELAY_FKPP_MIN,
-                                AUTO_PRINT_DELAY_FKPP_MAX,
-                                AUTO_PRINT_POST_DELAY_FKPP
-                            )
-                        else:
-                            konfirmasi_fkpp = input("Selesai print FKPP? (ENTER/y = tutup, n = stop): ").strip().lower()
-                            if konfirmasi_fkpp == 'n':
-                                stop_semua = True
-                                driver.switch_to.window(window_utama)
-                                break
-                        driver.close()
-                driver.switch_to.window(window_utama)
+                print("-> Tab FKPP dibuka, menunggu jendela cetak muncul...")
+
+                # Sama seperti tab SPP - render PDF/print preview kadang butuh lebih
+                # dari 10 detik untuk terbuka sebagai window baru, atau keburu tertutup
+                # sendiri sebelum sempat terdeteksi.
+                try:
+                    WebDriverWait(driver, 30).until(EC.number_of_windows_to_be(2))
+                    for win in driver.window_handles:
+                        if win != window_utama:
+                            driver.switch_to.window(win)
+                            if not auto_print:
+                                tanya_auto = input("Otomatis print semua? (1 = Ya, ENTER = Manual): ").strip()
+                                if tanya_auto == '1':
+                                    auto_print = True
+                            if auto_print:
+                                jalankan_auto_print(
+                                    driver,
+                                    AUTO_PRINT_DELAY_FKPP_MIN,
+                                    AUTO_PRINT_DELAY_FKPP_MAX,
+                                    AUTO_PRINT_POST_DELAY_FKPP
+                                )
+                            else:
+                                konfirmasi_fkpp = input("Selesai print FKPP? (ENTER/y = tutup, n = stop): ").strip().lower()
+                                if konfirmasi_fkpp == 'n':
+                                    stop_semua = True
+                                    driver.switch_to.window(window_utama)
+                                    break
+                            driver.close()
+                    driver.switch_to.window(window_utama)
+                except Exception as e:
+                    print(f"⚠️ Tab cetak FKPP tidak terdeteksi otomatis: {str(e)[:60] or 'window tidak terbuka/tertutup sendiri'}.")
+                    print("   Silakan cetak FKPP secara manual di browser kalau belum tercetak, lalu tutup tab cetaknya.")
+                    input("Setelah selesai, tekan ENTER di sini untuk bot melanjutkan (pasien berikutnya)...")
+                    try:
+                        for win in driver.window_handles:
+                            if win != window_utama:
+                                driver.switch_to.window(win)
+                                driver.close()
+                        driver.switch_to.window(window_utama)
+                    except Exception:
+                        pass
 
                 if stop_semua:
                     break
@@ -1317,6 +1758,7 @@ def jalankan_pelayanan(driver, wb_data, sheet_data, path_file):
             else:
                 driver.get("https://pcarejkn.bpjs-kesehatan.go.id/eclaim/EntriKunjunganDokkel")
                 tunggu_loading_pace(driver)
+                tutup_modal_alert(driver)
     else:
         nama_file = os.path.basename(path_file)
         nama_sheet = sheet_data.title
@@ -1341,25 +1783,37 @@ def jalankan_pendaftaran(driver, wb_data, sheet_data, path_file):
         print("-> Masuk ke menu Pendaftaran Pasien.")
     except: pass
     
-    try:
-        btn_modal_ok2 = WebDriverWait(driver, 5).until(EC.element_to_be_clickable((By.CSS_SELECTOR, "button.bootbox-accept")))
-        btn_modal_ok2.click()
-        tunggu_loading_pace(driver)
-    except: pass
-    
+    tutup_modal_alert(driver)
+
+    # Pastikan Turnstile benar-benar terverifikasi dulu di sini, sebelum memproses
+    # baris apa pun - bukan disisipkan di tengah pengisian data per pasien.
+    pastikan_turnstile_terselesaikan(driver)
+
     maks_baris = sheet_data.max_row
     yes_to_all = False
     skip_name_check = False
-    
+    baris_kosong_berturut = 0
+
     for row in range(4, maks_baris + 1):
         if cek_sesi_berakhir(driver):
             driver.get("https://pcarejkn.bpjs-kesehatan.go.id/eclaim/EntriDaftarDokkel")
             tunggu_loading_pace(driver)
+            tutup_modal_alert(driver)
 
         nama_excel = sheet_data.cell(row=row, column=2).value
-        no_bpjs = sheet_data.cell(row=row, column=4).value    
-        status_input = sheet_data.cell(row=row, column=18).value 
-        
+        no_bpjs = sheet_data.cell(row=row, column=4).value
+        status_input = sheet_data.cell(row=row, column=18).value
+
+        nama_kosong = not nama_excel or str(nama_excel).strip() == ""
+        bpjs_kosong = not no_bpjs or str(no_bpjs).strip() == ""
+        if nama_kosong and bpjs_kosong:
+            baris_kosong_berturut += 1
+            if baris_kosong_berturut >= 5:
+                print(f"-> Mendeteksi {baris_kosong_berturut} baris kosong berturut-turut, dianggap akhir data (berhenti di baris {row}).")
+                break
+            continue
+        baris_kosong_berturut = 0
+
         if status_input and str(status_input).strip() != "":
             print(f"[{row}/{maks_baris}] Melewati baris {row} ({nama_excel}) - Status: {status_input}")
             continue
@@ -1392,12 +1846,15 @@ def jalankan_pendaftaran(driver, wb_data, sheet_data, path_file):
             input_bpjs.clear() 
             time.sleep(0.2)
             
-            input_bpjs.send_keys(str(no_bpjs)) 
-            driver.find_element(By.ID, "cariRujukanByNoka_btn").click()
-            
-            WebDriverWait(driver, 20).until(EC.invisibility_of_element_located((By.ID, "daftarRujukan_tbl_processing")))
-            time.sleep(1) 
-            
+            input_bpjs.send_keys(str(no_bpjs))
+
+            def klik_cari_rujukan():
+                driver.find_element(By.ID, "cariRujukanByNoka_btn").click()
+                WebDriverWait(driver, 20).until(EC.invisibility_of_element_located((By.ID, "daftarRujukan_tbl_processing")))
+                time.sleep(1)
+
+            klik_search_dengan_retry_captcha(driver, klik_cari_rujukan)
+
             try:
                 btn_pilih_rujukan = driver.find_element(By.XPATH, "//table[@id='daftarRujukan_tbl']/tbody/tr[1]/td[1]//button[contains(@onclick, 'rujukanHorizontalSelected')]")
                 nama_tabel = driver.find_element(By.XPATH, "//table[@id='daftarRujukan_tbl']/tbody/tr[1]/td[3]").text
@@ -1484,6 +1941,7 @@ def jalankan_pendaftaran(driver, wb_data, sheet_data, path_file):
             else:
                 driver.get("https://pcarejkn.bpjs-kesehatan.go.id/eclaim/EntriDaftarDokkel")
                 tunggu_loading_pace(driver)
+                tutup_modal_alert(driver)
     else:
         nama_file = os.path.basename(path_file)
         nama_sheet = sheet_data.title
@@ -1495,14 +1953,35 @@ def jalankan_pendaftaran(driver, wb_data, sheet_data, path_file):
 # MAIN EKSEKUSI
 # ====================================================================
 
-def jalankan_agent():
+def cari_chrome_exe():
+    if os.environ.get("CHROME_PATH"):
+        return os.environ["CHROME_PATH"]
+    kandidat = [
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+        os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
+    ]
+    for path in kandidat:
+        if os.path.isfile(path):
+            return path
+    return None
+
+def pilih_file_dan_mode():
     path_file, nama_sheet, wb_data = setup_folder_excel()
     sheet_data = wb_data[nama_sheet]
-    
+
+    # Sel gabungan (merged cells) hanya bisa ditulis lewat sel pojok kiri-atasnya
+    # (openpyxl melempar error 'MergedCell...read-only' kalau ditulis lewat sel lain
+    # dalam gabungan itu). Lepas semua gabungan supaya semua sel bisa ditulis bebas.
+    for rng in list(sheet_data.merged_cells.ranges):
+        sheet_data.unmerge_cells(str(rng))
+
     opsi_mode = ["1. Pendaftaran Pasien", "2. Pelayanan Pasien (Input Hasil)"]
     idx_mode, mode_terpilih = menu_interaktif(opsi_mode, "Pilih Mode Operasi Bot:")
+    return path_file, nama_sheet, wb_data, sheet_data, idx_mode
 
-    nama_file_excel_user = 'data_user.xlsx' 
+def jalankan_agent():
+    nama_file_excel_user = 'data_user.xlsx'
     try:
         wb_user = openpyxl.load_workbook(nama_file_excel_user)
         sheet_user = wb_user['Sheet1']
@@ -1517,73 +1996,155 @@ def jalankan_agent():
         print("Error: Username/Password kosong di Excel user!")
         return
 
-    print("Membuka browser...")
-    chrome_options = Options()
+    manual_chrome_proc = None
+    print("Menyiapkan Chrome untuk login manual (menghindari deteksi otomasi Cloudflare)...")
+    chrome_exe = cari_chrome_exe()
+    if not chrome_exe:
+        print("⚠️ Google Chrome tidak ditemukan di lokasi standar. Set environment variable CHROME_PATH ke lokasi chrome.exe Anda.")
+        return
+
+    debug_port = 9333
+    manual_profile_dir = os.path.join(os.environ.get("TEMP") or ".", "pcare_bot_profile")
+    chrome_args = [
+        chrome_exe,
+        f"--remote-debugging-port={debug_port}",
+        f"--user-data-dir={manual_profile_dir}",
+        "--no-first-run",
+    ]
     if ENABLE_KIOSK_PRINTING:
-        chrome_options.add_argument("--kiosk-printing")
-        if PRINTER_NAME:
-            app_state = {
-                "recentDestinations": [{"id": PRINTER_NAME, "origin": "local", "account": ""}],
-                "selectedDestinationId": PRINTER_NAME,
-                "version": 2
-            }
-            chrome_options.add_experimental_option(
-                "prefs",
-                {"printing.print_preview_sticky_settings.appState": json.dumps(app_state)}
-            )
-    driver = webdriver.Chrome(options=chrome_options)
-    driver.maximize_window()
-    driver.get("https://pcarejkn.bpjs-kesehatan.go.id/eclaim/login")
+        chrome_args.append("--kiosk-printing")
+    # Langsung ke halaman yang butuh login (bukan /eclaim/login). Kalau sesi lama
+    # di profile ini masih aktif, PCare akan tetap di halaman ini; kalau tidak,
+    # PCare otomatis redirect ke halaman login.
+    chrome_args.append("https://pcarejkn.bpjs-kesehatan.go.id/eclaim/EntriDaftarDokkel")
 
-    print(f"\nMencoba login otomatis untuk: {username}")
+    manual_chrome_proc = subprocess.Popen(chrome_args)
+    time.sleep(3)
 
+    print("Menghubungkan bot ke browser...")
+    chrome_options = Options()
+    chrome_options.add_experimental_option("debuggerAddress", f"127.0.0.1:{debug_port}")
+
+    driver = None
+    nama_pasien_resume = None
     try:
-        while True:
-            isi_kredensial(driver, username, password)
+        driver = webdriver.Chrome(options=chrome_options)
 
-            print("\n" + "="*60)
-            print("MENGUNGGU INPUT CAPTCHA")
-            print("1. Username dan Password sudah diisi otomatis.")
-            print("2. Silakan ketik kode CAPTCHA di browser (5-6 karakter).")
-            print("3. Bot akan klik 'Sign In' otomatis setelah terdeteksi.")
-            print("="*60)
-            
-            if not tunggu_captcha_dan_login(driver):
-                print("-> Proses login dibatalkan.")
-                return
-            
-            tunggu_loading_pace(driver)
-            hasil_login = tunggu_hasil_login(driver, timeout=15)
-            if hasil_login == "success":
-                break
-            if hasil_login == "failed":
-                print("⚠️ Login gagal. Mengulang input username/password...")
-                tunggu_loading_pace(driver)
-                try:
-                    driver.find_element(By.ID, "CaptchaInputText").clear()
-                except Exception:
-                    pass
+        # Kalau ada tab lain yang sudah terbuka di halaman Pelayanan Pasien dengan
+        # data pasien sudah tampil (misal hasil pencarian manual gara-gara Turnstile),
+        # pakai tab itu dan lewati langkah pencarian pertama - jangan buka tab baru.
+        handle_kunjungan_aktif = None
+        for handle in driver.window_handles:
+            driver.switch_to.window(handle)
+            try:
+                url_lower = driver.current_url.lower()
+            except Exception:
                 continue
-            lanjut = input("Login belum terdeteksi. ENTER = coba lagi, n = batal: ").strip().lower()
-            if lanjut == 'n':
-                return
+            if "entrikunjungandokkel" in url_lower:
+                try:
+                    nama_txt = driver.find_element(By.ID, "lblnmpst").text.strip()
+                except Exception:
+                    nama_txt = ""
+                if nama_txt:
+                    handle_kunjungan_aktif = handle
+                    nama_pasien_resume = nama_txt
+                    break
 
-        try:
-            btn_modal_ok = WebDriverWait(driver, 5).until(EC.element_to_be_clickable((By.CSS_SELECTOR, "button.bootbox-accept")))
-            btn_modal_ok.click()
-            tunggu_loading_pace(driver)
-        except: pass
-        
-        if idx_mode == 0:
-            jalankan_pendaftaran(driver, wb_data, sheet_data, path_file)
-        elif idx_mode == 1:
-            jalankan_pelayanan(driver, wb_data, sheet_data, path_file)
+        if handle_kunjungan_aktif:
+            driver.switch_to.window(handle_kunjungan_aktif)
+            print(f"-> Mendeteksi tab Pelayanan Pasien yang sudah terbuka dengan data pasien '{nama_pasien_resume}', akan dilanjutkan tanpa refresh.")
+        else:
+            for handle in driver.window_handles:
+                driver.switch_to.window(handle)
+                if "pcarejkn" in driver.current_url.lower():
+                    break
+
+        if "login" in driver.current_url.lower():
+            print("\n" + "="*60)
+            print("LOGIN DIPERLUKAN")
+            print("Jendela Chrome baru saja terbuka ke halaman login PCare.")
+            print("Cloudflare Turnstile biasanya terverifikasi otomatis dalam beberapa detik.")
+            print("JANGAN TUTUP jendela Chrome tersebut.")
+            print("="*60)
+            opsi_login = [
+                "1. Isi Username/Password otomatis lalu langsung klik Sign In otomatis",
+                "2. Isi Username/Password otomatis, saya klik Sign In sendiri",
+                "3. Saya isi & login semuanya secara manual",
+            ]
+            idx_login, _ = menu_interaktif(opsi_login, "Setelah Turnstile terverifikasi (centang hijau), pilih cara login:")
+
+            while True:
+                if idx_login in (0, 1):
+                    input("Tekan ENTER setelah Turnstile terverifikasi untuk mengisi Username/Password...")
+                    try:
+                        isi_kredensial(driver, username, password)
+                        print("-> Username/Password terisi otomatis.")
+                    except Exception as e:
+                        print(f"⚠️ Gagal isi otomatis: {str(e)[:60]}. Silakan isi & login manual.")
+                        idx_login = 2
+
+                    if idx_login == 0:
+                        try:
+                            driver.find_element(By.ID, "btnLogin").click()
+                            print("-> Tombol Sign In diklik otomatis.")
+                        except Exception as e:
+                            print(f"⚠️ Gagal klik Sign In otomatis: {str(e)[:60]}. Silakan klik manual.")
+                            idx_login = 1
+
+                    if idx_login == 1:
+                        input("Silakan klik tombol Sign In secara manual, lalu tekan ENTER di sini...")
+                else:
+                    input("Tekan ENTER setelah berhasil login dan berada di Dashboard PCare...")
+
+                if "login" not in driver.current_url.lower():
+                    break
+                print("⚠️ Sepertinya masih di halaman login. Pastikan sudah berhasil masuk Dashboard, lalu coba lagi.")
+                idx_login = 2  # fallback ke manual kalau percobaan sebelumnya belum berhasil
+        else:
+            print("-> Sesi login sebelumnya masih aktif, melanjutkan otomatis tanpa login ulang.")
+        tutup_modal_alert(driver)
+
+        lanjut_file_lain = True
+        while lanjut_file_lain:
+            path_file, nama_sheet, wb_data, sheet_data, idx_mode = pilih_file_dan_mode()
+
+            if idx_mode == 0:
+                jalankan_pendaftaran(driver, wb_data, sheet_data, path_file)
+                lanjut_pelayanan = input(
+                    "\nSelesai Pendaftaran. Sekalian lakukan input Pelayanan Pasien "
+                    "untuk file & sheet yang sama? (Y/Enter = Ya, N = Tidak): "
+                ).strip().lower()
+                if lanjut_pelayanan in ("", "y"):
+                    jalankan_pelayanan(driver, wb_data, sheet_data, path_file, nama_pasien_resume)
+                    nama_pasien_resume = None
+            elif idx_mode == 1:
+                jalankan_pelayanan(driver, wb_data, sheet_data, path_file, nama_pasien_resume)
+                nama_pasien_resume = None
+
+            lagi = input("\nProses file Excel lain? (Y/Enter = Ya, N = Selesai): ").strip().lower()
+            lanjut_file_lain = lagi in ("", "y")
 
     except Exception as e:
         print(f"-> Terjadi error fatal: {str(e)[:150]}")
 
-    input("\nTekan ENTER untuk menutup browser dan mengakhiri program...")
-    driver.quit()
+    finally:
+        if driver:
+            input("\nTekan ENTER untuk menutup browser dan mengakhiri program...")
+            try:
+                driver.quit()
+            except Exception:
+                pass
+        if manual_chrome_proc and manual_chrome_proc.poll() is None:
+            if os.name == 'nt':
+                try:
+                    subprocess.run(
+                        ["taskkill", "/F", "/T", "/PID", str(manual_chrome_proc.pid)],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                    )
+                except Exception:
+                    manual_chrome_proc.terminate()
+            else:
+                manual_chrome_proc.terminate()
 
 if __name__ == "__main__":
     jalankan_agent()
